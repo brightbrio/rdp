@@ -20,13 +20,22 @@ jobs:
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name "fDenyTSConnections" -Value 0 -Force
+          # NLA OFF. 2026-11-10: with UserAuthentication=1 the client got
+          # "The remote computer requires Network Level Authentication, which
+          # your computer does not support" - this machine's mstsc cannot
+          # do CredSSP/NLA to the runner. SecurityLayer=0 puts the server on
+          # plain RDP Security, which the client negotiates fine, and the
+          # login is still protected because the box is only reachable over
+          # the Tailscale tailnet (no public port 3389 anywhere).
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 1 -Force
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null | Out-Null
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
-          Write-Host "RDP enabled"
+          Write-Host "RDP enabled (NLA off, RDP Security layer)"
 
       - name: Confirm the built-in admin account
         shell: pwsh
