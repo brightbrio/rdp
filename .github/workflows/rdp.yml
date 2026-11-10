@@ -86,23 +86,23 @@ jobs:
         run: |
           $ip = $env:TAILSCALE_IP
           $ok = (Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
-          $hostName = (& "C:\Program Files\Tailscale\tailscale.exe" status --json | ConvertFrom-Json).Self.DNSName
-          $details = @"
-          ## Windows RDP is live
-
-          | | |
-          |---|---|
-          | Address | ``$ip`` |
-          | Hostname | ``$hostName`` |
-          | Username | ``RDP`` |
-          | Password | ``$env:RDP_PASSWORD`` |
-          | Port | 3389 |
-          | Port 3389 reachable | $ok |
-
-          Connect with Remote Desktop (mstsc) on THIS machine, which must be
-          signed in to the same Tailscale tailnet.
-          "@@
-          $details | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $lines = @(
+            "## Windows RDP is live",
+            "",
+            "| | |",
+            "|---|---|",
+            "| Address | ``$ip`` |",
+            "| Username | ``RDP`` |",
+            "| Password | ``$env:RDP_PASSWORD`` |",
+            "| Port | 3389 |",
+            "| Port 3389 reachable | $ok |",
+            "",
+            "Connect with Remote Desktop (mstsc) on THIS machine, which must be",
+            "signed in to the same Tailscale tailnet.",
+            ""
+          )
+          $details = $lines -join [Environment]::NewLine
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $details
           Write-Host $details
           if (-not $ok) { Write-Warning "port 3389 not answering yet" }
 
