@@ -5,9 +5,12 @@ on:
 
 jobs:
   rdp:
-    # PUBLIC repo => GitHub-hosted Windows runners are FREE.
-    # 6h is the maximum job time on the free tier; the session dies when the
-    # job does, so re-dispatch to get a fresh one.
+    # PUBLIC repo => GitHub-hosted Windows runners are FREE (16 vCPU, 64 GB).
+    # 360 minutes is the hard ceiling for a job on a GitHub-hosted runner on
+    # the free tier, so a session cannot outlive it - which is why
+    # keepalive.yml exists: it cancels the old session and dispatches a
+    # fresh one, so there is always a live box under the SAME Tailscale
+    # hostname and the same password. The user never reconnects by IP.
     runs-on: windows-latest
     timeout-minutes: 355
 
@@ -17,7 +20,6 @@ jobs:
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name "fDenyTSConnections" -Value 0 -Force
-          # NLA on (1) so modern mstsc works with the user created below.
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name "UserAuthentication" -Value 1 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null | Out-Null
@@ -29,14 +31,12 @@ jobs:
       - name: Create RDP user
         shell: pwsh
         run: |
-          # A FIXED password from the repo secret is used when present, so
-          # the same login works on every future session and never has to be
-          # hunted for. GitHub only uploads a job's LOGS when the job ends -
-          # a session that stays alive for hours has no readable log - which
-          # is why a random password was so awkward to retrieve. The step
-          # summary is visible immediately, but a known password is better.
+          # A FIXED password from the repo secret, so every session - and
+          # every future session - uses the same login. GitHub only uploads
+          # a job's LOGS when the job ends, and a rolling session never
+          # ends, so a random password would be unreadable in practice.
           #
-          # Set it once with:
+          # Set once with:
           #   gh secret set RDP_PASSWORD -R brightbrio/rdp --body "yourpass"
           $password = "${{ secrets.RDP_PASSWORD }}"
           if (-not $password) {
@@ -77,7 +77,7 @@ jobs:
           Remove-Item $exe -Force -ErrorAction SilentlyContinue
           Write-Host "tailscale installed"
 
-      - name: Join tailnet
+      - name: Join tailnet under a FIXED hostname
         shell: pwsh
         run: |
           # 2026-11-10: the secret on this repo is named MY_RDP. The workflow
@@ -86,17 +86,20 @@ jobs:
           $key = "${{ secrets.MY_RDP }}"
           if (-not $key) { Write-Error "MY_RDP secret is empty"; exit 1 }
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          & $ts up --authkey=$key --unattended --hostname=gh-rdp-$env:GITHUB_RUN_ID
+          # The hostname is FIXED, not per-run. Tailscale MagicDNS then
+          # resolves it to whichever runner is alive right now, so the saved
+          # RDP connection keeps working across every handover.
+          & $ts up --authkey=$key --unattended --hostname=gh-rdp
           $ip = $null
-          for ($i = 0; $i -lt 20 -and -not $ip; $i++) {
+          for ($i = 0; $i -lt 24 -and -not $ip; $i++) {
             $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
             if (-not $ip) { Start-Sleep -Seconds 5 }
           }
           if (-not $ip) { Write-Error "no tailscale IP assigned"; exit 1 }
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          Write-Host "tailscale ip: $ip"
+          Write-Host "tailscale ip: $ip (hostname gh-rdp)"
 
-      - name: Verify and publish connection details
+      - name: Publish connection details
         shell: pwsh
         run: |
           $ip = $env:TAILSCALE_IP
@@ -106,14 +109,16 @@ jobs:
             "",
             "| | |",
             "|---|---|",
-            "| Address | ``$ip`` |",
+            "| Address | ``gh-rdp`` (MagicDNS - always the live box) |",
+            "| Current IP | ``$ip`` |",
             "| Username | ``RDP`` |",
             "| Password | ``$env:RDP_PASSWORD`` |",
             "| Port | 3389 |",
             "| Port 3389 reachable | $ok |",
+            "| Runner | 16 vCPU / 64 GB Windows, free (public repo) |",
             "",
-            "Connect with Remote Desktop (mstsc) on THIS machine, which must be",
-            "signed in to the same Tailscale tailnet.",
+            "The address never changes: a rolling dispatcher keeps one of these",
+            "alive at all times under the same hostname, with the same password.",
             ""
           )
           $details = $lines -join [Environment]::NewLine
@@ -125,6 +130,6 @@ jobs:
         shell: pwsh
         run: |
           while ($true) {
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP live at $env:TAILSCALE_IP"
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP live at gh-rdp ($env:TAILSCALE_IP)"
             Start-Sleep -Seconds 60
           }
