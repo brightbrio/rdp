@@ -1,0 +1,194 @@
+name: Windows RDP + ComfyUI
+
+# A free 16 vCPU / 64 GB Windows machine with:
+#   - Remote Desktop (over Tailscale, never public)
+#   - ComfyUI running on :8188, reachable over the same tailnet
+#
+# The models are the open-source stack, chosen to FIT the 14 GB runner disk:
+#   SD 1.5 checkpoint      4.27 GB
+#   AnimateDiff motion     1.82 GB   (mm_sd_v15_v2.ckpt)
+#   ComfyUI + torch CPU    ~4 GB
+#   ------------------------------
+#                            ~10 GB used, ~4 GB headroom
+#
+# There is NO GPU on a GitHub-hosted runner, so generation runs on the CPU.
+# That is slow - roughly 8-15 minutes for a 16-frame 512x512 clip - but the
+# 64 GB of RAM is what makes it possible at all: SD1.5 plus AnimateDiff in
+# fp32 will not fit in 8 GB, and it does not fit here either without care,
+# which is why the checkpoint is loaded in fp16.
+#
+# For GPU-speed generation use the Kaggle wall in the empire's render chain
+# (~30 h/week of free T4 machines) or set FAL_KEY.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  comfyui:
+    runs-on: windows-latest
+    timeout-minutes: 355
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Enable RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          # NLA off - this machine's mstsc cannot do CredSSP to the runner,
+          # and it errors with "requires Network Level Authentication".
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="ComfyUI-Tailscale" `
+            dir=in action=allow protocol=TCP localport=8188
+          Restart-Service -Name TermService -Force
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $exe = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $exe
+          Start-Process -FilePath $exe -ArgumentList "/quiet" -Wait
+          Remove-Item $exe -Force -ErrorAction SilentlyContinue
+
+      - name: Join tailnet under a FIXED hostname
+        shell: pwsh
+        run: |
+          $key = "${{ secrets.MY_RDP }}"
+          if (-not $key) { Write-Error "MY_RDP secret is empty"; exit 1 }
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts up --authkey=$key --unattended --hostname=gh-comfy
+          $ip = $null
+          for ($i = 0; $i -lt 24 -and -not $ip; $i++) {
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $ip) { Write-Error "no tailscale IP assigned"; exit 1 }
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "tailscale ip: $ip"
+
+      - name: Create the RDP accounts
+        shell: pwsh
+        run: |
+          $b64 = "${{ secrets.RDP_USERS_B64 }}"
+          if (-not $b64) {
+            Write-Host "no RDP_USERS_B64 secret - only runneradmin exists"
+            exit 0
+          }
+          $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+          foreach ($a in ($json | ConvertFrom-Json)) {
+            net user "$($a.name)" /delete 2>&1 | Out-Null
+            net user "$($a.name)" "$($a.password)" /add 2>&1 | Out-Host
+            net localgroup "Remote Desktop Users" "$($a.name)" /add 2>&1 | Out-Host
+            if ($a.admin) {
+              net localgroup "Administrators" "$($a.name)" /add 2>&1 | Out-Host
+            }
+          }
+          $global:LASTEXITCODE = 0
+          exit 0
+
+      - name: Clone ComfyUI and the node packs
+        shell: pwsh
+        run: |
+          $root = "$env:USERPROFILE\comfy"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Set-Location $root
+          git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git ComfyUI
+          Set-Location "$root\ComfyUI"
+          git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Manager.git custom_nodes\ComfyUI-Manager
+          git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-AnimateDiff-Evolved.git custom_nodes\ComfyUI-AnimateDiff-Evolved
+          git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git custom_nodes\ComfyUI-KJNodes
+          Write-Host "repos cloned"
+
+      - name: Install the Python stack (torch CPU)
+        shell: pwsh
+        run: |
+          $root = "$env:USERPROFILE\comfy\ComfyUI"
+          Set-Location $root
+          # CPU torch keeps the install inside the free disk; the CPU index is
+          # the one that matches the runner (no CUDA, no GPU).
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -r requirements.txt
+          Write-Host "python stack installed"
+
+      - name: Download the checkpoints
+        shell: pwsh
+        run: |
+          $models = "$env:USERPROFILE\comfy\ComfyUI\models"
+          New-Item -ItemType Directory -Force -Path "$models\checkpoints" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$models\animatediff_models" | Out-Null
+
+          $files = @(
+            @{ Url = "https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors";
+               To  = "$models\checkpoints\v1-5-pruned-emaonly.safetensors" },
+            @{ Url = "https://huggingface.co/guoyww/animatediff/resolve/main/mm_sd_v15_v2.ckpt";
+               To  = "$models\animatediff_models\mm_sd_v15_v2.ckpt" }
+          )
+          foreach ($f in $files) {
+            $name = Split-Path $f.To -Leaf
+            if ((Test-Path $f.To) -and (Get-Item $f.To).Length -gt 100MB) {
+              Write-Host "already have $name"
+              continue
+            }
+            Write-Host "downloading $name ..."
+            curl.exe -L --fail --retry 5 --retry-delay 5 -o $f.To $f.Url
+            $sz = (Get-Item $f.To).Length
+            Write-Host ("  {0} -> {1:N1} MB" -f $name, ($sz / 1MB))
+            if ($sz -lt 100MB) { throw "download of $name looks truncated ($sz bytes)" }
+          }
+          Write-Host "checkpoints ready"
+
+      - name: Start ComfyUI
+        shell: pwsh
+        run: |
+          $root = "$env:USERPROFILE\comfy\ComfyUI"
+          Set-Location $root
+          # --listen 0.0.0.0 so the tailnet can reach it; the firewall rule
+          # only opens it on the private Tailscale interface.
+          Start-Process python -ArgumentList @(
+            "main.py", "--listen", "0.0.0.0", "--port", "8188"
+          ) -WorkingDirectory $root -WindowStyle Hidden
+          Start-Sleep -Seconds 45
+          try {
+            $r = Invoke-WebRequest -Uri "http://127.0.0.1:8188/system_stats" -TimeoutSec 20 -UseBasicParsing
+            Write-Host "ComfyUI is up ($($r.StatusCode))"
+          } catch {
+            Write-Warning "ComfyUI did not answer yet: $($_.Exception.Message)"
+          }
+
+      - name: Publish the connection details
+        shell: pwsh
+        run: |
+          $ip = $env:TAILSCALE_IP
+          $lines = @(
+            "## ComfyUI is live", "",
+            "| | |", "|---|---|",
+            "| ComfyUI | ``http://$ip:8188`` |",
+            "| Address | ``gh-comfy`` (MagicDNS) |",
+            "| RDP | ``gh-comfy`` - user ``runneradmin`` |",
+            "| Machine | 16 vCPU / 64 GB Windows, free (public repo) |",
+            "| Models | SD 1.5 + AnimateDiff mm_sd_v15_v2 |",
+            "| GPU | none - generation runs on the CPU |", "",
+            "Open the ComfyUI URL in a browser to build workflows visually.",
+            "The pipeline is reachable from this machine at http://127.0.0.1:8188.",
+            ""
+          )
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ($lines -join [Environment]::NewLine)
+          Write-Host ($lines -join "`n")
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ComfyUI + RDP live at gh-comfy ($env:TAILSCALE_IP)"
+            Start-Sleep -Seconds 60
+          }
