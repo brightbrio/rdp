@@ -1,10 +1,7 @@
 name: lemo-opuscar preview (watercolor)
 
 # Capability test only: render a ~20-second preview of the demo film
-# "Follow the Rain" that ships with the lemo-opuscar library, on the free
-# Windows runner.
-#
-# The demo is NOT on your content and is not publishable for your niche.
+# "Follow the Rain" that ships with the lemo-opuscar library.
 
 on:
   workflow_dispatch:
@@ -51,9 +48,22 @@ jobs:
           }
           if (-not $ip) { Write-Error "no tailscale IP assigned"; exit 1 }
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
-          "CHOCO=C:/ProgramData/chocolatey/bin" >> $env:GITHUB_ENV
           Write-Host "tailscale ip: $ip"
-          Write-Host "choco: $env:CHOCO"
+
+      - name: Make ffmpeg visible to Git bash
+        shell: pwsh
+        run: |
+          # chocolatey installs ffmpeg at C:\ProgramData\chocolatey\bin\ffmpeg.exe
+          # pwsh can see it, but Git bash gets its own PATH and doesn't. Create a
+          # shim inside Git's bin so every call to ffmpeg — including from bash —
+          # resolves to choco's ffmpeg.
+          $target = "C:\ProgramData\chocolatey\bin\ffmpeg.exe"
+          $shim   = "C:\Program Files\Git\usr\bin\ffmpeg.exe"
+          if (-not (Test-Path $target)) {
+            choco install ffmpeg -y --no-progress
+          }
+          Copy-Item $target $shim -Force
+          Write-Host "ffmpeg shim installed at $shim -> $target"
 
       - name: Clone the lemo-opuscar library
         shell: pwsh
@@ -70,26 +80,15 @@ jobs:
           & $sh "$env:USERPROFILE\lemo-opuscar\plugin\skills\lemo-opuscar\scripts\setup.sh" deps voice music
           Write-Host "deps done"
 
-      - name: Download the demo score (CC BY 4.0)
+      - name: Build demo (voice, subtitles, music score)
         shell: pwsh
         run: |
-          $env:PATH = "C:\ProgramData\chocolatey\bin;$env:PATH"
-          $sh = "C:\Program Files\Git\bin\sh.exe"
-          & $sh "$env:USERPROFILE\lemo-opuscar\styles\watercolor\demo\music\prep.sh"
-          Get-ChildItem "$env:USERPROFILE\lemo-opuscar\styles\watercolor\demo\music" |
-            Select-Object Name, Length | Format-Table -AutoSize
-
-      - name: Build voice + mix + subtitles
-        shell: pwsh
-        run: |
-          $env:PATH = "C:\ProgramData\chocolatey\bin;$env:PATH"
           $sh = "C:\Program Files\Git\bin\sh.exe"
           & $sh "$env:USERPROFILE\lemo-opuscar\styles\watercolor\demo\build.sh"
 
       - name: Render a ~20 second preview
         shell: pwsh
         run: |
-          $env:PATH = "C:\ProgramData\chocolatey\bin;$env:PATH"
           Set-Location "$env:USERPROFILE\lemo-opuscar\styles\watercolor\demo"
           node render.mjs part 0 20 preview.mp4
           $dest = "$env:TEMP\preview_final.mp4"
