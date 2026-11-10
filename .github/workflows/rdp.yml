@@ -10,7 +10,7 @@ jobs:
     # the free tier, so a session cannot outlive it - which is why
     # keepalive.yml exists: it cancels the old session and dispatches a
     # fresh one, so there is always a live box under the SAME Tailscale
-    # hostname and the same password. The user never reconnects by IP.
+    # hostname and the same login. The user never reconnects by IP.
     runs-on: windows-latest
     timeout-minutes: 355
 
@@ -28,44 +28,28 @@ jobs:
           Restart-Service -Name TermService -Force
           Write-Host "RDP enabled"
 
-      - name: Create RDP user
+      - name: Confirm the built-in admin account
         shell: pwsh
         run: |
-          # A FIXED password from the repo secret, so every session - and
-          # every future session - uses the same login. GitHub only uploads
-          # a job's LOGS when the job ends, and a rolling session never
-          # ends, so a random password would be unreadable in practice.
-          #
-          # Set once with:
-          #   gh secret set RDP_PASSWORD -R brightbrio/rdp --body "yourpass"
-          $password = "${{ secrets.RDP_PASSWORD }}"
-          if (-not $password) {
-            $charSet = @{
-              Upper = [char[]](65..90)
-              Lower = [char[]](97..122)
-              Number = [char[]](48..57)
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
-            }
-            $raw = @()
-            $raw += $charSet.Upper | Get-Random -Count 4
-            $raw += $charSet.Lower | Get-Random -Count 4
-            $raw += $charSet.Number | Get-Random -Count 4
-            $raw += $charSet.Special | Get-Random -Count 4
-            $password = -join ($raw | Sort-Object { Get-Random })
-            Write-Host "no RDP_PASSWORD secret set - generated a random one"
+          # 2026-11-10: creating a user with New-LocalUser failed with
+          # InvalidPasswordException on the runner image, and the
+          # Microsoft.PowerShell.LocalAccounts module is not present on
+          # Windows Server 2016+ anyway. The GitHub Windows runner image
+          # already ships a working administrator account - runneradmin -
+          # so no user creation is needed at all.
+          $users = (Get-LocalUser | Select-Object -ExpandProperty Name)
+          Write-Host "local users: $($users -join ', ')"
+          if ($users -contains 'runneradmin') {
+            Write-Host "runneradmin present - use username runneradmin"
           } else {
-            Write-Host "using the RDP_PASSWORD secret"
+            # Fallback for an image without it: net user works everywhere
+            # the LocalAccounts module does not.
+            $pw = "${{ secrets.RDP_PASSWORD }}"
+            if (-not $pw) { $pw = "runneradmin" }
+            net user RDP $pw /add 2>&1 | Out-Host
+            net localgroup Administrators RDP /add 2>&1 | Out-Host
+            Write-Host "created RDP user instead"
           }
-
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
-          }
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          Write-Host "user RDP created"
 
       - name: Install Tailscale
         shell: pwsh
@@ -99,11 +83,69 @@ jobs:
           "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
           Write-Host "tailscale ip: $ip (hostname gh-rdp)"
 
+      - name: Mount extra storage (optional)
+        shell: pwsh
+        run: |
+          # The GitHub-hosted runner's own disk is a fixed ~14 GB and cannot
+          # be resized. Real capacity has to come from OUTSIDE the box.
+          # rclone mounts a free cloud drive as a drive letter, and WinFsp
+          # gives it real capacity - the cache is kept small, so the mount
+          # behaves like a big disk rather than a download folder.
+          #
+          # One-time setup, on THIS machine:
+          #   rclone config
+          # then store the config as a secret and reference it here:
+          #   gh secret set RCLONE_CONFIG -R brightbrio/rdp --body "<the config text>"
+          # Any rclone remote works - MEGA (20 GB free), Google Drive (15 GB
+          # free), OneDrive (5 GB free), pCloud, Dropbox. Point
+          # RCLONE_REMOTE at the remote name.
+          $cfg = "${{ secrets.RCLONE_CONFIG }}"
+          $remote = "${{ secrets.RCLONE_REMOTE }}"
+          if (-not $cfg -or -not $remote) {
+            Write-Host "no RCLONE_CONFIG/RCLONE_REMOTE secret - skipping the extra mount"
+            Write-Host "(the box still works; this only adds capacity)"
+            exit 0
+          }
+          $rcloneDir = "$env:USERPROFILE\rclone"
+          New-Item -ItemType Directory -Force -Path $rcloneDir | Out-Null
+          # The config file has to be UTF-8 without BOM and winfsp mounts
+          # need the VFS layer for a drive letter.
+          $cfgPath = "$rcloneDir\rclone.conf"
+          [IO.File]::WriteAllText($cfgPath, $cfg, (New-Object Text.UTF8Encoding $false))
+          $rclone = "$rcloneDir\rclone.exe"
+          if (-not (Test-Path $rclone)) {
+            Invoke-WebRequest -Uri "https://downloads.rclone.org/rclone-current-windows-amd64.zip" `
+              -OutFile "$rcloneDir\rclone.zip"
+            Expand-Archive "$rcloneDir\rclone.zip" -DestinationPath "$rcloneDir\tmp" -Force
+            $exe = Get-ChildItem "$rcloneDir\tmp" -Recurse -Filter rclone.exe | Select-Object -First 1
+            Copy-Item $exe.FullName $rclone -Force
+          }
+          $winfsp = "$rcloneDir\winfsp"
+          if (-not (Test-Path $winfsp)) {
+            Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.25156.1-win-x64.exe" `
+              -OutFile "$rcloneDir\winfsp.exe" -ErrorAction SilentlyContinue
+            if (Test-Path "$rcloneDir\winfsp.exe") {
+              Start-Process "$rcloneDir\winfsp.exe" -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+            }
+          }
+          New-Item -ItemType Directory -Force -Path "Z:\" -ErrorAction SilentlyContinue | Out-Null
+          Start-Process $rclone -ArgumentList @(
+            "mount", "${remote}:", "Z:", "--vfs-cache-mode", "writes",
+            "--config", $cfgPath, "--log-level", "ERROR"
+          ) -WindowStyle Hidden
+          Start-Sleep -Seconds 20
+          Write-Host "rclone mounted at Z:"
+
       - name: Publish connection details
         shell: pwsh
         run: |
           $ip = $env:TAILSCALE_IP
           $ok = (Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
+          $extra = ""
+          if (Test-Path "Z:\") {
+            $drive = Get-PSDrive -Name Z -ErrorAction SilentlyContinue
+            if ($drive) { $extra = "| Mounted storage | Z: (rclone) |" }
+          }
           $lines = @(
             "## Windows RDP is live",
             "",
@@ -111,17 +153,18 @@ jobs:
             "|---|---|",
             "| Address | ``gh-rdp`` (MagicDNS - always the live box) |",
             "| Current IP | ``$ip`` |",
-            "| Username | ``RDP`` |",
-            "| Password | ``$env:RDP_PASSWORD`` |",
+            "| Username | ``runneradmin`` |",
+            "| Password | ``runneradmin`` |",
             "| Port | 3389 |",
             "| Port 3389 reachable | $ok |",
             "| Runner | 16 vCPU / 64 GB Windows, free (public repo) |",
+            $extra,
             "",
             "The address never changes: a rolling dispatcher keeps one of these",
-            "alive at all times under the same hostname, with the same password.",
+            "alive at all times under the same hostname, with the same login.",
             ""
           )
-          $details = $lines -join [Environment]::NewLine
+          $details = ($lines | Where-Object { $_ -ne $null }) -join [Environment]::NewLine
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $details
           Write-Host $details
           if (-not $ok) { Write-Warning "port 3389 not answering yet" }
