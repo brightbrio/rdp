@@ -1,0 +1,61 @@
+name: Keep an RDP session alive
+
+# 2026-11-10: a job on a GitHub-hosted runner cannot exceed 360 minutes on
+# the free tier, so one RDP session cannot literally last forever. What CAN
+# last forever is a RELATIONSHIP: this workflow keeps exactly one fresh
+# session alive at all times, under the same Tailscale hostname (gh-rdp)
+# and the same password, so the saved Remote Desktop connection never has to
+# change - the IP moves, the name does not.
+#
+# It runs two ways:
+#   1. on a schedule, every 4 hours - a handover before the current box dies
+#   2. at the end of every RDP session - the session hands over to its own
+#      replacement before it goes, so there is no gap in cover
+#
+# The old session is cancelled before the new one starts: two runners cannot
+# hold the same Tailscale hostname at once.
+
+on:
+  schedule:
+    # every 4 hours
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+
+    steps:
+      - name: Cancel any live RDP session
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner, repo, workflow_id: 'rdp.yml', status: 'in_progress'
+            });
+            for (const run of runs.data.workflow_runs) {
+              core.info(`cancelling stale session ${run.id}`);
+              await github.rest.actions.cancelWorkflowRun({
+                owner, repo, run_id: run.id
+              });
+            }
+            if (!runs.data.workflow_runs.length) {
+              core.info('no live session to cancel');
+            }
+
+      - name: Start a fresh RDP session
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const res = await github.rest.actions.createWorkflowDispatch({
+              owner, repo, workflow_id: 'rdp.yml', ref: 'main'
+            });
+            core.info(`dispatched a fresh session (${res.status})`);
