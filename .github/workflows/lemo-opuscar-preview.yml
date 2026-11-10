@@ -55,9 +55,9 @@ jobs:
         run: |
           # chocolatey installs ffmpeg at C:\ProgramData\chocolatey\bin\ffmpeg.exe
           # pwsh can see it, but Git bash gets its own PATH and doesn't. Create a
-          # shim inside Git's bin so every call to ffmpeg — including from bash —
+          # shim inside Git's bin so every call to ffmpeg â€” including from bash â€”
           # resolves to choco's ffmpeg.
-          $target = "C:\ProgramData\chocolatey\bin\ffmpeg.exe"
+          $target = "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin\ffmpeg.exe"
           $shim   = "C:\Program Files\Git\usr\bin\ffmpeg.exe"
           if (-not (Test-Path $target)) {
             choco install ffmpeg -y --no-progress
