@@ -29,18 +29,33 @@ jobs:
       - name: Create RDP user
         shell: pwsh
         run: |
-          $charSet = @{
-            Upper = [char[]](65..90)
-            Lower = [char[]](97..122)
-            Number = [char[]](48..57)
-            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          # A FIXED password from the repo secret is used when present, so
+          # the same login works on every future session and never has to be
+          # hunted for. GitHub only uploads a job's LOGS when the job ends -
+          # a session that stays alive for hours has no readable log - which
+          # is why a random password was so awkward to retrieve. The step
+          # summary is visible immediately, but a known password is better.
+          #
+          # Set it once with:
+          #   gh secret set RDP_PASSWORD -R brightbrio/rdp --body "yourpass"
+          $password = "${{ secrets.RDP_PASSWORD }}"
+          if (-not $password) {
+            $charSet = @{
+              Upper = [char[]](65..90)
+              Lower = [char[]](97..122)
+              Number = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+            }
+            $raw = @()
+            $raw += $charSet.Upper | Get-Random -Count 4
+            $raw += $charSet.Lower | Get-Random -Count 4
+            $raw += $charSet.Number | Get-Random -Count 4
+            $raw += $charSet.Special | Get-Random -Count 4
+            $password = -join ($raw | Sort-Object { Get-Random })
+            Write-Host "no RDP_PASSWORD secret set - generated a random one"
+          } else {
+            Write-Host "using the RDP_PASSWORD secret"
           }
-          $raw = @()
-          $raw += $charSet.Upper | Get-Random -Count 4
-          $raw += $charSet.Lower | Get-Random -Count 4
-          $raw += $charSet.Number | Get-Random -Count 4
-          $raw += $charSet.Special | Get-Random -Count 4
-          $password = -join ($raw | Sort-Object { Get-Random })
 
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
