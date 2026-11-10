@@ -4,38 +4,112 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  rdp:
+    # PUBLIC repo => GitHub-hosted Windows runners are FREE.
+    # 6h is the maximum job time on the free tier; the session dies when the
+    # job does, so re-dispatch to get a fresh one.
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
 
     steps:
-    - name: Enable RDP
-      run: |
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
-        echo "RDP Enabled successfully!"
+      - name: Enable RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+          # NLA on (1) so modern mstsc works with the user created below.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP enabled"
 
-    - name: Install Tailscale
-      run: |
-        powershell -Command "Invoke-WebRequest -Uri https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe -OutFile tailscale-setup.exe"
-        Start-Process -FilePath "tailscale-setup.exe" -ArgumentList "/quiet" -Wait
+      - name: Create RDP user
+        shell: pwsh
+        run: |
+          $charSet = @{
+            Upper = [char[]](65..90)
+            Lower = [char[]](97..122)
+            Number = [char[]](48..57)
+            Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $raw = @()
+          $raw += $charSet.Upper | Get-Random -Count 4
+          $raw += $charSet.Lower | Get-Random -Count 4
+          $raw += $charSet.Number | Get-Random -Count 4
+          $raw += $charSet.Special | Get-Random -Count 4
+          $password = -join ($raw | Sort-Object { Get-Random })
 
-    - name: Connect to Tailscale
-      run: |
-        & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --unattended
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          }
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          Write-Host "user RDP created"
 
-    - name: Get Connection Details
-      run: |
-        echo "=== RDP CONNECTION INFO ==="
-        & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-        echo "Username: runneradmin"
-        echo "==========================="
-        
-    - name: Keep Runner Alive
-      run: |
-        $i = 0
-        while ($true) {
-          Start-Sleep -Seconds 30
-          $i++
-        }
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $exe = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe
+          Start-Process -FilePath $exe -ArgumentList "/quiet" -Wait
+          Remove-Item $exe -Force -ErrorAction SilentlyContinue
+          Write-Host "tailscale installed"
+
+      - name: Join tailnet
+        shell: pwsh
+        run: |
+          # 2026-11-10: the secret on this repo is named MY_RDP. The workflow
+          # referenced secrets.TAILSCALE_AUTH_KEY, which does not exist here,
+          # so the join step silently had no key to use.
+          $key = "${{ secrets.MY_RDP }}"
+          if (-not $key) { Write-Error "MY_RDP secret is empty"; exit 1 }
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts up --authkey=$key --unattended --hostname=gh-rdp-$env:GITHUB_RUN_ID
+          $ip = $null
+          for ($i = 0; $i -lt 20 -and -not $ip; $i++) {
+            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if (-not $ip) { Start-Sleep -Seconds 5 }
+          }
+          if (-not $ip) { Write-Error "no tailscale IP assigned"; exit 1 }
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "tailscale ip: $ip"
+
+      - name: Verify and publish connection details
+        shell: pwsh
+        run: |
+          $ip = $env:TAILSCALE_IP
+          $ok = (Test-NetConnection -ComputerName $ip -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
+          $hostName = (& "C:\Program Files\Tailscale\tailscale.exe" status --json | ConvertFrom-Json).Self.DNSName
+          $details = @"
+          ## Windows RDP is live
+
+          | | |
+          |---|---|
+          | Address | ``$ip`` |
+          | Hostname | ``$hostName`` |
+          | Username | ``RDP`` |
+          | Password | ``$env:RDP_PASSWORD`` |
+          | Port | 3389 |
+          | Port 3389 reachable | $ok |
+
+          Connect with Remote Desktop (mstsc) on THIS machine, which must be
+          signed in to the same Tailscale tailnet.
+          "@@
+          $details | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host $details
+          if (-not $ok) { Write-Warning "port 3389 not answering yet" }
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP live at $env:TAILSCALE_IP"
+            Start-Sleep -Seconds 60
+          }
