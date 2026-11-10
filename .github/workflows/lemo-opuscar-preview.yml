@@ -2,16 +2,13 @@ name: lemo-opuscar preview (watercolor)
 
 # Capability test only: render a ~20-second preview of the demo film
 # "Follow the Rain" that ships with the lemo-opuscar library, on the free
-# Windows runner. The full film is 6,816 frames / ~4 minutes, which would be
-# an expensive use of free runner time for something you cannot publish.
+# Windows runner.
 #
 # Preview = the opening of the demo: the oblique orbit over Australia, the
 # first measurement, the subtitle strip working. If you like it, run the
-# full build later (WORKERS=16 on this box).
+# full build later.
 #
-# The demo is NOT on your content and is not publishable for your niche. It
-# is here so you can see the engine's colour, type, camera grammar and
-# sound in a real finished clip.
+# The demo is NOT on your content and is not publishable for your niche.
 
 on:
   workflow_dispatch:
@@ -71,38 +68,40 @@ jobs:
       - name: Install deps (core + voice + music)
         shell: pwsh
         run: |
+          $sh = "C:\Program Files\Git\bin\sh.exe"
           Set-Location "$env:USERPROFILE\lemo-opuscar"
-          sh scripts/setup.sh deps voice music
+          & $sh scripts/setup.sh deps voice music
           Write-Host "deps done"
 
       - name: Download the demo score (CC BY 4.0)
         shell: pwsh
         run: |
+          $sh = "C:\Program Files\Git\bin\sh.exe"
           Set-Location "$env:USERPROFILE\lemo-opuscar\styles\watercolor\demo"
-          sh music/prep.sh
+          & $sh music/prep.sh
           Get-ChildItem Wildflowers.mp3 | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Build voice + mix + subtitles
         shell: pwsh
         run: |
+          $sh = "C:\Program Files\Git\bin\sh.exe"
           Set-Location "$env:USERPROFILE\lemo-opuscar"
-          sh styles/watercolor/demo/build.sh
+          & $sh styles/watercolor/demo/build.sh
 
       - name: Render a ~20 second preview
         shell: pwsh
         run: |
           Set-Location "$env:USERPROFILE\lemo-opuscar\styles\watercolor\demo"
           node render.mjs part 0 20 preview.mp4
-          ffmpeg -v error -y -i preview.mp4 -i out/mix.wav \
-            -c:v copy -c:a aac -shortest preview_final.mp4
-          Move-Item -Force preview_final.mp4 "$env:TEMP\preview_final.mp4"
-          Write-Host "preview written: $env:TEMP\preview_final.mp4"
-          Get-ChildItem "$env:TEMP\preview_final.mp4" | Select-Object Length
+          $dest = "$env:TEMP\preview_final.mp4"
+          ffmpeg -v error -y -i preview.mp4 -i out/mix.wav `
+            -c:v copy -c:a aac -shortest $dest
+          Get-ChildItem $dest | Select-Object Length
 
       - name: Upload the preview
         shell: pwsh
         run: |
-          gh release create lemo-watercolor-preview \
-            "$env:TEMP\preview_final.mp4" \
-            --title "lemo-opuscar preview: Follow the Rain (watercolor)" \
-            --notes "20s preview of the demo film. See capability test in the workflow." || true
+          gh release create lemo-watercolor-preview `
+            "$env:TEMP\preview_final.mp4" `
+            --title "lemo-opuscar preview: Follow the Rain (watercolor)" `
+            --notes "20s preview of the demo film." || true
